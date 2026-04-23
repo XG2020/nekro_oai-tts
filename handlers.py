@@ -90,22 +90,43 @@ async def _synthesize_audio(text: str, voice: str = "", user_message: str = "") 
     if not api_key:
         raise ValueError("请先在插件配置中填写 MIMO_API_KEY。")
 
-    effective_voice = (voice or config.DEFAULT_VOICE or "").strip()
-    if not effective_voice:
-        raise ValueError("请先配置默认音色，或在调用时显式传入 voice。")
-
+    model = (config.MODEL or "mimo-v2.5-tts").strip()
     base_url = _normalize_base_url(config.BASE_URL)
     endpoint = f"{base_url}/chat/completions"
+    
+    audio_payload = {"format": (config.AUDIO_FORMAT or "wav").strip()}
+    
+    final_user_message = user_message or config.DEFAULT_USER_MESSAGE or ""
+
+    if model == "mimo-v2.5-tts-voiceclone":
+        clone_source = (config.VOICE_CLONE_SOURCE or "").strip()
+        if not clone_source:
+            raise ValueError("请先在插件配置中填写 VOICE_CLONE_SOURCE。")
+        
+        if not clone_source.startswith("data:audio/"):
+            raise ValueError("VOICE_CLONE_SOURCE 格式不正确，应为 'data:audio/...' 格式的 Data URI。")
+
+        audio_payload["voice"] = clone_source
+        final_user_message = ""  # VoiceClone 不支持 user message
+
+    elif model == "mimo-v2.5-tts-voicedesign":
+        if not final_user_message:
+             raise ValueError("使用 mimo-v2.5-tts-voicedesign 模型时，必须提供 user_message 用于描述音色。")
+        # VoiceDesign 不需要 voice id
+
+    else:  # 默认为 mimo-v2.5-tts
+        effective_voice = (voice or config.DEFAULT_VOICE or "").strip()
+        if not effective_voice:
+            raise ValueError("请先配置默认音色，或在调用时显式传入 voice。")
+        audio_payload["voice"] = effective_voice
+
     payload = {
-        "model": (config.MODEL or "mimo-v2-tts").strip(),
+        "model": model,
         "messages": _build_messages(
             text=text,
-            user_message=user_message or config.DEFAULT_USER_MESSAGE,
+            user_message=final_user_message,
         ),
-        "audio": {
-            "format": (config.AUDIO_FORMAT or "wav").strip(),
-            "voice": effective_voice,
-        },
+        "audio": audio_payload,
     }
     headers = {
         "api-key": api_key,
@@ -173,7 +194,16 @@ async def _run_tts_and_send(
         user_message=user_message,
     )
     sent_path = await _send_audio_message(_ctx, audio_bytes)
-    plugin.logger.info(f"[{_ctx.chat_key}] MiMo 语音发送成功: voice={voice or config.DEFAULT_VOICE}, path={sent_path}")
+    
+    model = (config.MODEL or "mimo-v2.5-tts").strip()
+    if model == "mimo-v2.5-tts-voiceclone":
+        display_voice = "克隆音色"
+    elif model == "mimo-v2.5-tts-voicedesign":
+        display_voice = "设计音色"
+    else:
+        display_voice = voice or config.DEFAULT_VOICE
+
+    plugin.logger.info(f"[{_ctx.chat_key}] MiMo 语音发送成功: model={model}, voice={display_voice}, path={sent_path}")
     return sent_path
 
 
@@ -191,16 +221,17 @@ async def send_mimo_voice(
     """发送 MiMo 语音消息。
 
     Args:
-        content (str): 要合成的正文内容。可以直接包含细粒度音频标签，例如（小声）、（沉默片刻）、（咳嗽）、（提高音量喊话）等。
-        voice (str): 可选音色，留空则使用插件默认音色。常用值：mimo_default、default_zh、default_en。
-        user_message (str): 必填 user 角色消息，用于辅助调整语气。
+        content (str): 要合成的正文内容。可以直接包含细粒度音频标签，例如 [小声]、[沉默片刻]、[咳嗽]、[提高音量喊话] 等。
+        voice (str): 可选音色，留空则使用插件默认音色。可用音色见插件帮助。
+        user_message (str): 用于辅助调整语气。使用 mimo-v2.5-tts 时为风格描述，使用 mimo-v2.5-tts-voicedesign 时为音色描述。
 
     Returns:
         str: 发送结果说明。
 
     Example:
-        send_mimo_voice(content="今天辛苦啦，早点休息。")
-        send_mimo_voice(content="（紧张，深呼吸）呼……冷静，冷静。不就是一个面试吗……（小声）哎呀，领带歪没歪？", voice="default_zh")
+        send_mimo_voice(content="今天辛苦啦，早点休息。", voice="冰糖")
+        send_mimo_voice(content="[紧张][深呼吸]呼……冷静，冷静。", voice="苏打")
+        send_mimo_voice(content="这个新功能太棒了！", user_message="用活泼的少女音说")
     """
 
     sent_path = await _run_tts_and_send(
@@ -214,16 +245,16 @@ async def send_mimo_voice(
 
 @plugin.mount_prompt_inject_method(name="mimo_tts_prompt")
 async def mimo_tts_prompt(_ctx: AgentCtx) -> str:
-    voice_hint = _voice_hint_text() or "mimo_default / default_zh / default_en"
+    voice_hint = _voice_hint_text() or "冰糖, 茉莉, 苏打, 白桦, Mia, Chloe, Milo, Dean"
     audio_tag_examples = _audio_tag_examples_text()
 
     return (
         "你可以在需要“读出来”“配音”“语音回复”“情绪化朗读”时主动调用 `发送MiMo语音`。\n"
         "使用规则：\n"
-        "1. 你可以自行选择 `voice`，而不是固定使用默认音色。\n"
+        "1. 你可以根据场景自行选择 `voice`，而不是固定使用默认音色。\n"
         "2. 你可以直接把细粒度音频标签写进 `content` 正文，标签会原样参与语音合成。\n"
-        "3. 中文场景优先考虑 `default_zh` 或 `mimo_default`，英文场景优先考虑 `default_en`。\n"
-        "4. 如果用户强调情绪、演绎、停顿、呼吸、耳语、喊话、咳嗽等表现，请直接在 `content` 中加入音频标签。\n\n"
+        "3. 你可以通过 `user_message` 传递自然语言指令来控制语音风格。\n"
+        "4. 如果用户强调情绪、演绎、停顿、呼吸、耳语、喊话、咳嗽等表现，请优先在 `content` 中加入音频标签。\n\n"
         f"可用音色参考：\n{voice_hint}\n\n"
         f"细粒度音频标签示例：\n{audio_tag_examples}"
     )
@@ -243,7 +274,7 @@ async def mimo_tts_speak_cmd(
 ) -> CommandResponse:
     raw = (args_str or "").strip()
     if not raw:
-        return CmdCtl.failed("用法: mimo_tts_speak 文本")
+        return CmdCtl.failed("用法: /mimo_tts_speak 文本")
 
     ctx = await AgentCtx.create_by_chat_key(context.chat_key)
     try:
@@ -255,8 +286,15 @@ async def mimo_tts_speak_cmd(
         plugin.logger.exception(f"[{context.chat_key}] MiMo 命令发送失败: {exc}")
         return CmdCtl.failed(f"MiMo 语音发送失败: {exc}")
 
-    effective_voice = (config.DEFAULT_VOICE or "").strip() or "未配置"
-    return CmdCtl.success(f"MiMo 语音已发送，音色: {effective_voice}")
+    model = (config.MODEL or "mimo-v2.5-tts").strip()
+    if model == "mimo-v2.5-tts-voiceclone":
+        display_voice = "克隆音色"
+    elif model == "mimo-v2.5-tts-voicedesign":
+        display_voice = "设计音色"
+    else:
+        display_voice = config.DEFAULT_VOICE
+
+    return CmdCtl.success(f"MiMo 语音已发送，模型: {model}, 音色: {display_voice}")
 
 
 @plugin.mount_command(
@@ -269,18 +307,19 @@ async def mimo_tts_speak_cmd(
 )
 async def mimo_tts_help_cmd(context: CommandExecutionContext) -> CommandResponse:
     return CmdCtl.success(
-        "MiMo TTS 插件用法:\n"
-        "/mimo_tts_speak 文本\n"
-        "/mimo_tts_speak [小声,温柔]明天见\n\n"
+        "MiMo TTS 插件 (v2.5) 用法:\n"
+        "/mimo_tts_speak [文本] - 使用配置的默认模型和音色合成语音。\n"
+        "/mimo_tts_speak [小声][温柔]明天见 - 使用音频标签控制语音。\n\n"
         "AI 能力:\n"
-        "- AI 可以自行切换 voice\n"
-        "- AI 可以直接在正文里写 [小声][沉默片刻][咳嗽] 这类音频标签\n"
-        "- 不再使用整体风格 style，避免和音频标签冲突\n\n"
+        "- AI 可以根据配置的 `MODEL` 选择合成方式。\n"
+        "- `mimo-v2.5-tts`: 使用 `voice` 参数选择预置音色，或用 `user_message` 控制风格。\n"
+        "- `mimo-v2.5-tts-voicedesign`: 使用 `user_message` 描述想要的音色。\n"
+        "- `mimo-v2.5-tts-voiceclone`: 使用 `VOICE_CLONE_SOURCE` 配置的音频 Data URI 克隆音色。\n"
+        "- AI 可以在 `content` 中使用音频标签进行细粒度控制。\n\n"
         "主要配置项:\n"
-        "- MIMO_API_KEY: MiMo 平台 API Key\n"
-        "- DEFAULT_VOICE: 默认音色，如 mimo_default/default_zh/default_en\n"
-        "- VOICE_OPTIONS_HINT: 音色说明，提供给 AI 参考\n"
-        "- AUDIO_TAG_EXAMPLES: 音频标签示例，注入给 AI 参考\n"
-        "- DEFAULT_USER_MESSAGE: 可选 user 角色提示\n"
-        "- AUDIO_FORMAT: 建议使用 wav"
+        "- `MODEL`: 使用的模型 (mimo-v2.5-tts, mimo-v2.5-tts-voicedesign, mimo-v2.5-tts-voiceclone)。\n"
+        "- `DEFAULT_VOICE`: 预置音色模型的默认音色 (如: 冰糖)。\n"
+        "- `VOICE_CLONE_SOURCE`: 音色克隆用的音频 Data URI。\n"
+        "- `DEFAULT_USER_MESSAGE`: `mimo-v2.5-tts` 模型的默认风格指令。\n"
+        f"可用预置音色:\n{_voice_hint_text()}"
     )
